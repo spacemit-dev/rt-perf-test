@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -59,6 +60,11 @@ struct rpmsg_perf_config {
     uint32_t payload_size;
     uint32_t packet_count;
     uint32_t report_interval;
+};
+
+struct rpmsg_dev_snapshot {
+    dev_t devs[64];
+    size_t count;
 };
 
 static volatile sig_atomic_t stop_requested;
@@ -141,9 +147,68 @@ static int parse_args(int argc, char **argv, struct rpmsg_perf_config *cfg)
     return 0;
 }
 
+static void snapshot_rpmsg_devs(struct rpmsg_dev_snapshot *snapshot)
+{
+    char path[64];
+    struct stat st;
+    int i;
+
+    snapshot->count = 0;
+    for (i = 0; i < 64; ++i) {
+        snprintf(path, sizeof(path), "/dev/rpmsg%d", i);
+        if (stat(path, &st) == 0 && snapshot->count < sizeof(snapshot->devs) / sizeof(snapshot->devs[0])) {
+            snapshot->devs[snapshot->count++] = st.st_rdev;
+        }
+    }
+}
+
+static int snapshot_has_dev(const struct rpmsg_dev_snapshot *snapshot, dev_t dev)
+{
+    size_t i;
+
+    for (i = 0; i < snapshot->count; ++i) {
+        if (snapshot->devs[i] == dev) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int find_new_rpmsg_data_dev(const struct rpmsg_dev_snapshot *before,
+                                   char *path, size_t path_size)
+{
+    char candidate[64];
+    struct stat st;
+    int last_existing = -1;
+    int i;
+
+    for (i = 0; i < 64; ++i) {
+        snprintf(candidate, sizeof(candidate), "/dev/rpmsg%d", i);
+        if (stat(candidate, &st) != 0) {
+            continue;
+        }
+        last_existing = i;
+        if (!snapshot_has_dev(before, st.st_rdev)) {
+            snprintf(path, path_size, "%s", candidate);
+            return 0;
+        }
+    }
+
+    if (last_existing >= 0) {
+        snprintf(path, path_size, "/dev/rpmsg%d", last_existing);
+        return 0;
+    }
+
+    return -1;
+}
+
 static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *data_fd)
 {
     struct rpmsg_endpoint_info epinfo;
+    struct rpmsg_dev_snapshot before;
+    char data_dev[64];
+
+    snapshot_rpmsg_devs(&before);
 
     *ctrl_fd = open(cfg->ctrl_dev, O_RDWR);
     if (*ctrl_fd < 0) {
@@ -163,17 +228,38 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
         return -1;
     }
 
-    *data_fd = open(cfg->data_dev, O_RDWR);
+    if (strcmp(cfg->data_dev, DEFAULT_RPMSG_DATA_DEV) == 0) {
+        if (find_new_rpmsg_data_dev(&before, data_dev, sizeof(data_dev)) != 0) {
+            fprintf(stderr, "failed to locate rpmsg data device\n");
+            ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
+            close(*ctrl_fd);
+            *ctrl_fd = -1;
+            return -1;
+        }
+    } else {
+        snprintf(data_dev, sizeof(data_dev), "%s", cfg->data_dev);
+    }
+
+    *data_fd = open(data_dev, O_RDWR);
     if (*data_fd < 0) {
-        fprintf(stderr, "open %s failed: %s\n", cfg->data_dev, strerror(errno));
+        fprintf(stderr, "open %s failed: %s\n", data_dev, strerror(errno));
+        ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
+        close(*ctrl_fd);
+        *ctrl_fd = -1;
+        return -1;
+    }
+    if (fcntl(*data_fd, F_SETFL, fcntl(*data_fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+        fprintf(stderr, "set %s nonblock failed: %s\n", data_dev, strerror(errno));
+        close(*data_fd);
+        *data_fd = -1;
         ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
         close(*ctrl_fd);
         *ctrl_fd = -1;
         return -1;
     }
 
-    printf("RPMsg ready: service=%s src=%u dst=%u\n",
-           cfg->service_name, cfg->local_addr, cfg->remote_addr);
+        printf("RPMsg ready: service=%s src=%u dst=%u dev=%s\n",
+            cfg->service_name, cfg->local_addr, cfg->remote_addr, data_dev);
     return 0;
 }
 
@@ -188,14 +274,14 @@ static void rpmsg_close(int ctrl_fd, int data_fd)
     }
 }
 
-static int read_echo(int fd, struct rpmsg_perf_frame *frame, size_t expected_len)
+static int wait_fd_ready(int fd, short events, const char *op)
 {
     struct pollfd pfd;
     int ret;
 
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = fd;
-    pfd.events = POLLIN;
+    pfd.events = events;
 
     while (!stop_requested) {
         ret = poll(&pfd, 1, 3000);
@@ -203,28 +289,73 @@ static int read_echo(int fd, struct rpmsg_perf_frame *frame, size_t expected_len
             if (errno == EINTR) {
                 continue;
             }
-            fprintf(stderr, "poll failed: %s\n", strerror(errno));
+            fprintf(stderr, "poll %s failed: %s\n", op, strerror(errno));
             return -1;
         }
         if (ret == 0) {
-            fprintf(stderr, "timeout waiting echo\n");
+            fprintf(stderr, "timeout waiting %s\n", op);
             return -1;
         }
-        if (pfd.revents & POLLIN) {
-            ret = (int)read(fd, frame, RPMSG_PERF_MAX_FRAME_SIZE);
-            if (ret < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue;
-                }
-                fprintf(stderr, "read failed: %s\n", strerror(errno));
-                return -1;
-            }
-            if ((size_t)ret == expected_len) {
-                return ret;
-            }
-            fprintf(stderr, "unexpected echo length: %d, expected=%zu\n", ret, expected_len);
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "rpmsg fd error while waiting %s, revents=0x%x\n",
+                    op, pfd.revents);
             return -1;
         }
+        if (pfd.revents & events) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static ssize_t write_frame(int fd, const struct rpmsg_perf_frame *frame,
+                           size_t frame_len, uint32_t seq)
+{
+    uint64_t start_ns = now_ns();
+    ssize_t wr;
+
+    while (!stop_requested) {
+        wr = write(fd, frame, frame_len);
+        if (wr >= 0) {
+            return wr;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            fprintf(stderr, "write failed at seq=%u: %s\n", seq, strerror(errno));
+            return -1;
+        }
+        if (now_ns() - start_ns >= 3000000000ULL) {
+            fprintf(stderr, "timeout waiting tx buffer at seq=%u\n", seq);
+            return -1;
+        }
+        poll(NULL, 0, 1);
+    }
+
+    return -1;
+}
+
+static int read_echo(int fd, struct rpmsg_perf_frame *frame, size_t expected_len)
+{
+    int ret;
+
+    while (!stop_requested) {
+        if (wait_fd_ready(fd, POLLIN, "echo") < 0) {
+            return -1;
+        }
+
+        ret = (int)read(fd, frame, RPMSG_PERF_MAX_FRAME_SIZE);
+        if (ret < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            fprintf(stderr, "read failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if ((size_t)ret == expected_len) {
+            return ret;
+        }
+        fprintf(stderr, "unexpected echo length: %d, expected=%zu\n", ret, expected_len);
+        return -1;
     }
 
     return -1;
@@ -278,9 +409,8 @@ int main(int argc, char **argv)
         tx_frame.seq = i;
         tx_frame.send_ns = now_ns();
 
-        wr = write(data_fd, &tx_frame, frame_len);
+        wr = write_frame(data_fd, &tx_frame, frame_len, i);
         if (wr < 0) {
-            fprintf(stderr, "write failed at seq=%u: %s\n", i, strerror(errno));
             break;
         }
         if ((size_t)wr != frame_len) {

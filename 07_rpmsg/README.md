@@ -14,13 +14,15 @@
 | 参数 | 值 |
 | --- | --- |
 | 服务名 | `rpmsg:perf_test` |
-| 小核地址 | `1010` |
-| 大核地址 | `1011` |
+| 小核地址 | `1002` |
+| 大核地址 | `1003` |
 | 默认控制设备 | `/dev/rpmsg_ctrl0` |
 | 默认数据设备 | `/dev/rpmsg0` |
-| 最大 frame 长度 | `2048 bytes` |
+| RPMsg buffer 长度 | `512 bytes` |
+| RPMsg 头长度 | `16 bytes` |
+| 最大 frame 长度 | `496 bytes` |
 | frame 头长度 | `20 bytes` |
-| 最大 payload 长度 | `2028 bytes` |
+| 最大 payload 长度 | `476 bytes` |
 
 ## 小核侧使用
 
@@ -37,7 +39,7 @@ rpmsg_perf
 ```text
 [RPMSG_PERF] Service starting...
 [RPMSG_PERF] rpdev ready, creating endpoint...
-[RPMSG_PERF] Endpoint created: rpmsg:perf_test (src=1010, dst=1011), max_frame=2048, tx_payload_limit=xxx, rx_payload_limit=xxx
+[RPMSG_PERF] Endpoint created: rpmsg:perf_test (src=1002, dst=1003), max_frame=496, tx_payload_limit=496, rx_payload_limit=496
 ```
 
 测试过程中小核每秒打印一次：
@@ -79,7 +81,7 @@ sudo ./k3_rpmsg_perf
 示例输出：
 
 ```text
-RPMsg ready: service=rpmsg:perf_test src=1011 dst=1010
+RPMsg ready: service=rpmsg:perf_test src=1003 dst=1002
 [1000/10000] avg_rtt=xxx.xx us min=xxx.xx us max=xxx.xx us throughput=xxx.xx KB/s
 ...
 Summary: packets=10000 payload=128 frame=148 elapsed=x.xxx s
@@ -96,7 +98,7 @@ sudo ./k3_rpmsg_perf -n 50000 -s 256 -r 5000
 | 参数 | 说明 |
 | --- | --- |
 | `-n <count>` | 发送包数量 |
-| `-s <bytes>` | payload 大小，范围 `0..2028` |
+| `-s <bytes>` | payload 大小，范围 `0..476` |
 | `-r <count>` | 每多少个包打印一次统计 |
 | `-c <device>` | RPMsg control 设备，默认 `/dev/rpmsg_ctrl0` |
 | `-d <device>` | RPMsg data 设备，默认 `/dev/rpmsg0` |
@@ -104,7 +106,7 @@ sudo ./k3_rpmsg_perf -n 50000 -s 256 -r 5000
 ## 测试建议
 
 1. 先使用默认 `128 bytes` payload 测 RTT 和基础吞吐。
-2. 再分别测试典型 payload：`0`、`32`、`64`、`128`、`256`、`476`、`1024`、`2028`。
+2. 再分别测试典型 payload：`0`、`32`、`64`、`128`、`256`、`476`。
 3. 大核程序采用一发一收模式，因此统计的是 request/echo 往返性能，不是纯单向极限吞吐。
 4. 如果提示 `timeout waiting echo`，检查小核是否已执行 `rpmsg_perf`，以及 `/dev/rpmsg_ctrl0`、`/dev/rpmsg0` 是否存在。
-5. 代码层最大 frame 已放大到 `2048 bytes`，但最终是否能发送超过 `496 bytes` 仍取决于底层 RPMsg/virtio buffer 配置。小核启动时打印的 `tx_payload_limit` / `rx_payload_limit` 是当前固件实际可用的单包 payload 上限；如果仍为约 `496`，需要同步放大 OpenAMP 的 `RPMSG_BUFFER_SIZE` 以及 Linux 侧 RPMsg vring buffer 配置。
+5. 当前固件使用 OpenAMP 默认 `RPMSG_BUFFER_SIZE=512`，扣除 `struct rpmsg_hdr` 的 `16 bytes` 后，RPMsg 单包可承载 frame 上限为 `496 bytes`，本测试自定义 frame 头为 `20 bytes`，因此最大 payload 为 `476 bytes`。如需测试更大 payload，需要同步放大 OpenAMP 的 `RPMSG_BUFFER_SIZE` 以及 Linux 侧 RPMsg vring buffer 配置，并同步调整两端 `RPMSG_PERF_RPMSG_BUFFER_SIZE`。

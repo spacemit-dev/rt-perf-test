@@ -179,7 +179,6 @@ static int find_new_rpmsg_data_dev(const struct rpmsg_dev_snapshot *before,
 {
     char candidate[64];
     struct stat st;
-    int last_existing = -1;
     int i;
 
     for (i = 0; i < 64; ++i) {
@@ -187,16 +186,25 @@ static int find_new_rpmsg_data_dev(const struct rpmsg_dev_snapshot *before,
         if (stat(candidate, &st) != 0) {
             continue;
         }
-        last_existing = i;
         if (!snapshot_has_dev(before, st.st_rdev)) {
             snprintf(path, path_size, "%s", candidate);
             return 0;
         }
     }
 
-    if (last_existing >= 0) {
-        snprintf(path, path_size, "/dev/rpmsg%d", last_existing);
-        return 0;
+    return -1;
+}
+
+static int wait_new_rpmsg_data_dev(const struct rpmsg_dev_snapshot *before,
+                                   char *path, size_t path_size)
+{
+    uint64_t start_ns = now_ns();
+
+    while (now_ns() - start_ns < 3000000000ULL) {
+        if (find_new_rpmsg_data_dev(before, path, path_size) == 0) {
+            return 0;
+        }
+        poll(NULL, 0, 10);
     }
 
     return -1;
@@ -207,6 +215,7 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
     struct rpmsg_endpoint_info epinfo;
     struct rpmsg_dev_snapshot before;
     char data_dev[64];
+    int flags;
 
     snapshot_rpmsg_devs(&before);
 
@@ -229,9 +238,8 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
     }
 
     if (strcmp(cfg->data_dev, DEFAULT_RPMSG_DATA_DEV) == 0) {
-        if (find_new_rpmsg_data_dev(&before, data_dev, sizeof(data_dev)) != 0) {
+        if (wait_new_rpmsg_data_dev(&before, data_dev, sizeof(data_dev)) != 0) {
             fprintf(stderr, "failed to locate rpmsg data device\n");
-            ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
             close(*ctrl_fd);
             *ctrl_fd = -1;
             return -1;
@@ -243,33 +251,43 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
     *data_fd = open(data_dev, O_RDWR);
     if (*data_fd < 0) {
         fprintf(stderr, "open %s failed: %s\n", data_dev, strerror(errno));
-        ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
         close(*ctrl_fd);
         *ctrl_fd = -1;
         return -1;
     }
-    if (fcntl(*data_fd, F_SETFL, fcntl(*data_fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-        fprintf(stderr, "set %s nonblock failed: %s\n", data_dev, strerror(errno));
+    flags = fcntl(*data_fd, F_GETFL, 0);
+    if (flags < 0) {
+        fprintf(stderr, "get %s flags failed: %s\n", data_dev, strerror(errno));
+        ioctl(*data_fd, RPMSG_DESTROY_EPT_IOCTL);
         close(*data_fd);
         *data_fd = -1;
-        ioctl(*ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
+        close(*ctrl_fd);
+        *ctrl_fd = -1;
+        return -1;
+    }
+    if (fcntl(*data_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "set %s nonblock failed: %s\n", data_dev, strerror(errno));
+        ioctl(*data_fd, RPMSG_DESTROY_EPT_IOCTL);
+        close(*data_fd);
+        *data_fd = -1;
         close(*ctrl_fd);
         *ctrl_fd = -1;
         return -1;
     }
 
-        printf("RPMsg ready: service=%s src=%u dst=%u dev=%s\n",
-            cfg->service_name, cfg->local_addr, cfg->remote_addr, data_dev);
+    printf("RPMsg ready: service=%s src=%u dst=%u dev=%s\n",
+           cfg->service_name, cfg->local_addr, cfg->remote_addr, data_dev);
+    fflush(stdout);
     return 0;
 }
 
 static void rpmsg_close(int ctrl_fd, int data_fd)
 {
     if (data_fd >= 0) {
+        ioctl(data_fd, RPMSG_DESTROY_EPT_IOCTL);
         close(data_fd);
     }
     if (ctrl_fd >= 0) {
-        ioctl(ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
         close(ctrl_fd);
     }
 }

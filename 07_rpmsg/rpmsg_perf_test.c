@@ -44,6 +44,7 @@ struct rpmsg_perf_frame {
 struct rpmsg_perf_ctx {
     char *service_name;
     struct rpmsg_endpoint endp;
+    rt_bool_t service_started;
     rt_bool_t endpoint_ready;
     volatile rt_uint32_t rx_packets;
     volatile rt_uint32_t tx_packets;
@@ -142,25 +143,33 @@ static void rpmsg_perf_init_thread_entry(void *parameter)
         rt_thread_delay(10);
     }
 
-    rt_kprintf("[RPMSG_PERF] rpdev ready, creating endpoint...\n");
+    rt_kprintf("[RPMSG_PERF] rpdev ready\n");
 
     rpmsg_perf.service_name = RPMSG_PERF_SERVICE_NAME;
-    ret = rpmsg_create_ept(&rpmsg_perf.endp, rpdev, rpmsg_perf.service_name,
-                           RPMSG_PERF_ADDR_SRC, RPMSG_PERF_ADDR_DST,
-                           rpmsg_perf_endpoint_cb, rpmsg_perf_service_unbind);
-    if (ret) {
-        rt_kprintf("[RPMSG_PERF] Create endpoint failed, ret=%d\n", ret);
-        return;
-    }
+    while (1) {
+        if (!rpmsg_perf.endpoint_ready) {
+            rt_kprintf("[RPMSG_PERF] creating endpoint...\n");
+            ret = rpmsg_create_ept(&rpmsg_perf.endp, rpdev, rpmsg_perf.service_name,
+                                   RPMSG_PERF_ADDR_SRC, RPMSG_PERF_ADDR_DST,
+                                   rpmsg_perf_endpoint_cb, rpmsg_perf_service_unbind);
+            if (ret) {
+                rt_kprintf("[RPMSG_PERF] Create endpoint failed, ret=%d\n", ret);
+                rt_thread_mdelay(1000);
+                continue;
+            }
 
-    rpmsg_perf.endpoint_ready = RT_TRUE;
-    rt_kprintf("[RPMSG_PERF] Endpoint created: %s (src=%u, dst=%u), max_frame=%u, tx_payload_limit=%d, rx_payload_limit=%d\n",
-               rpmsg_perf.service_name,
-               RPMSG_PERF_ADDR_SRC,
-               RPMSG_PERF_ADDR_DST,
-               RPMSG_PERF_MAX_FRAME_SIZE,
-               rpmsg_virtio_get_tx_buffer_size(rpdev),
-               rpmsg_virtio_get_rx_buffer_size(rpdev));
+            rpmsg_perf.endpoint_ready = RT_TRUE;
+            rt_kprintf("[RPMSG_PERF] Endpoint created: %s (src=%u, dst=%u), max_frame=%u, tx_payload_limit=%d, rx_payload_limit=%d\n",
+                       rpmsg_perf.service_name,
+                       RPMSG_PERF_ADDR_SRC,
+                       RPMSG_PERF_ADDR_DST,
+                       RPMSG_PERF_MAX_FRAME_SIZE,
+                       rpmsg_virtio_get_tx_buffer_size(rpdev),
+                       rpmsg_virtio_get_rx_buffer_size(rpdev));
+        }
+
+        rt_thread_mdelay(100);
+    }
 }
 
 int rpmsg_perf_start(void)
@@ -168,18 +177,20 @@ int rpmsg_perf_start(void)
     rt_thread_t init_tid;
     rt_thread_t print_tid;
 
-    if (rpmsg_perf.endpoint_ready) {
+    if (rpmsg_perf.service_started) {
         rt_kprintf("[RPMSG_PERF] Already started\n");
         return 0;
     }
 
     rt_memset(&rpmsg_perf, 0, sizeof(rpmsg_perf));
+    rpmsg_perf.service_started = RT_TRUE;
 
     init_tid = rt_thread_create("rpmsg_pi", rpmsg_perf_init_thread_entry,
                                 RT_NULL, RPMSG_PERF_THREAD_STACK_SIZE,
                                 RT_THREAD_PRIORITY_MAX / 3, 20);
     if (init_tid == RT_NULL) {
         rt_kprintf("[RPMSG_PERF] Failed to create init thread\n");
+        rpmsg_perf.service_started = RT_FALSE;
         return -RT_EINVAL;
     }
     rt_thread_startup(init_tid);
@@ -189,6 +200,7 @@ int rpmsg_perf_start(void)
                                  RT_THREAD_PRIORITY_MAX / 3 + 1, 20);
     if (print_tid == RT_NULL) {
         rt_kprintf("[RPMSG_PERF] Failed to create stat thread\n");
+        rpmsg_perf.service_started = RT_FALSE;
         return -RT_EINVAL;
     }
     rt_thread_startup(print_tid);

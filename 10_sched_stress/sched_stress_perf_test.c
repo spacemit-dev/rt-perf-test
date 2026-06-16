@@ -22,6 +22,7 @@
 #define SCHED_STRESS_TIMESLICE         5
 #define SCHED_STRESS_PRINT_INTERVAL    1000U
 #define SCHED_STRESS_PRINT_PROGRESS    0
+#define SCHED_STRESS_WARMUP_LOOPS      100U
 #define SCHED_STRESS_BUSY_WORK         1600U
 #define SCHED_STRESS_CTRL_WORK         320U
 #define SCHED_STRESS_BUSY_YIELD_EVERY  16U
@@ -139,6 +140,7 @@ static void sched_stress_busy_worker(void *parameter)
         if ((sched_stress_counters.busy_loops % SCHED_STRESS_BUSY_YIELD_EVERY) == 0U) {
             rt_thread_yield();
         }
+        rt_thread_mdelay(1);
     }
 }
 
@@ -251,8 +253,8 @@ static void sched_stress_thread_entry(void *parameter)
     }
 
     rt_kprintf("\n[SCHED] Scheduler stress test started\n");
-    rt_kprintf("[SCHED] duration=%u ms, control period=%u ms\n",
-               SCHED_STRESS_DURATION_MS, SCHED_STRESS_PERIOD_MS);
+    rt_kprintf("[SCHED] duration=%u ms, control period=%u ms, warmup=%u loops\n",
+               SCHED_STRESS_DURATION_MS, SCHED_STRESS_PERIOD_MS, SCHED_STRESS_WARMUP_LOOPS);
     rt_kprintf("[SCHED] workers: busy(prio=%u), yield(prio=%u), sleep(prio=%u), ipc(prio=%u)\n\n",
                SCHED_STRESS_BUSY_PRIO,
                SCHED_STRESS_YIELD_PRIO,
@@ -274,24 +276,27 @@ static void sched_stress_thread_entry(void *parameter)
         rt_thread_mdelay(SCHED_STRESS_PERIOD_MS);
         loop_start = sched_stress_now_ticks();
         interval_ticks = loop_start - last_ticks;
-        sched_stress_stat_add(&sched_stress_period_stat, interval_ticks);
-        sched_stress_stat_add(&sched_stress_jitter_stat,
-                              SCHED_STRESS_ABS_DIFF(interval_ticks, period_ticks));
-        if (interval_ticks > (period_ticks + period_ticks / 2ULL)) {
-            sched_stress_counters.miss_1500us++;
-        }
-        if (interval_ticks > (period_ticks * 2ULL)) {
-            sched_stress_counters.miss_2000us++;
-        }
-        if (interval_ticks > (period_ticks * 5ULL)) {
-            sched_stress_counters.miss_5000us++;
+        if (sched_stress_counters.control_loops >= SCHED_STRESS_WARMUP_LOOPS) {
+            sched_stress_stat_add(&sched_stress_period_stat, interval_ticks);
+            sched_stress_stat_add(&sched_stress_jitter_stat,
+                                  SCHED_STRESS_ABS_DIFF(interval_ticks, period_ticks));
+            if (interval_ticks > (period_ticks + period_ticks / 2ULL)) {
+                sched_stress_counters.miss_1500us++;
+            }
+            if (interval_ticks > (period_ticks * 2ULL)) {
+                sched_stress_counters.miss_2000us++;
+            }
+            if (interval_ticks > (period_ticks * 5ULL)) {
+                sched_stress_counters.miss_5000us++;
+            }
         }
 
         guard += sched_stress_control_work(sched_stress_counters.control_loops);
         loop_end = sched_stress_now_ticks();
-        sched_stress_stat_add(&sched_stress_compute_stat, loop_end - loop_start);
-
-        sched_stress_ipc_signal_ticks = sched_stress_now_ticks();
+        if (sched_stress_counters.control_loops >= SCHED_STRESS_WARMUP_LOOPS) {
+            sched_stress_stat_add(&sched_stress_compute_stat, loop_end - loop_start);
+            sched_stress_ipc_signal_ticks = sched_stress_now_ticks();
+        }
         sched_stress_counters.ipc_signals++;
         rt_sem_release(&sched_stress_sem);
 

@@ -12,8 +12,8 @@
 | `04_AHRS/` | `ahrs_perf` | 四元数 AHRS 姿态解算性能测试 |
 | `05_memory/` | `mem_perf` | 内存/缓存访问性能测试，评估拷贝、填充、读写等基础内存操作 |
 | `06_rtlat/` | `rtlat_perf` | 实时延迟测试，覆盖调度、抢占、IPC、IRQ 等实时性指标 |
-| `07_rpmsg/` | `rpmsg_perf` | 大核 Linux 与小核 ESOS/RT-Thread 的 RPMsg echo 通信性能测试；详细说明见 `07_rpmsg/README.md` |
-| `07_rpmsg_send/` | `rpmsg_send_test` | 大核 Linux 单线程发送、小核收到后 ACK、大核单线程接收并校验数量一致性；详细说明见 `07_rpmsg_send/README.md` |
+| `07_rpmsg/` | `rpmsg_perf` | 大核 Linux 与小核 ESOS/RT-Thread 的 RPMsg request/echo 往返性能测试，统计 RTT 和吞吐；详细说明见 `07_rpmsg/README.md` |
+| `07_rpmsg_send/` | `rpmsg_send_test` | 大核 Linux 发送 DATA、小核返回 `received` ACK 的确认链路测试，统计 ACK RTT 和发送吞吐；详细说明见 `07_rpmsg_send/README.md` |
 | `08_mpc/` | `mpc_perf` | 四轮 MPC 闭环控制性能测试 |
 | `09_model_infer/` | `model_perf` | 模型推理仿真性能测试 |
 | `10_sched_stress/` | `sched_perf` | 调度压力/多任务干扰测试 |
@@ -65,7 +65,16 @@ model_perf
 sched_perf
 ```
 
-多数算法类测试会创建后台线程执行固定周期循环，并周期性打印执行耗时、循环次数或统计结果。`rpmsg_perf` 作为通信服务，需要配合大核 Linux 侧测试程序使用，详见 `07_rpmsg/README.md`。
+多数算法类测试会创建后台线程执行固定周期循环，并周期性打印执行耗时、循环次数或统计结果。`rpmsg_perf` 和 `rpmsg_send_test` 作为大小核通信服务，需要配合大核 Linux 侧测试程序使用，详见 `07_rpmsg/README.md` 和 `07_rpmsg_send/README.md`。
+
+RPMsg 测试常用命令：
+
+```text
+rpmsg_perf          # 启动 echo 服务并开启小核统计打印
+rpmsg_perf 0        # 启动 echo 服务但关闭小核统计打印
+rpmsg_send_test     # 启动 DATA/ACK 服务但关闭小核统计打印
+rpmsg_send_test --print
+```
 
 ## 测试类型说明
 
@@ -83,14 +92,16 @@ sched_perf
 
 ### 大小核通信类
 
-`rpmsg_perf` 创建 `rpmsg:perf_test` 服务，小核收到大核 Linux 发送的数据后立即 echo 回传，用于测量 RPMsg request/echo 往返性能。`rpmsg_send_test` 创建 `rpmsg:send_test` 服务，大核 Linux 侧一个线程负责发送 DATA frame，另一个线程负责接收小核返回的 `received` ACK，测试结束后打印发送数量和 ACK 数量是否一致。
+`rpmsg_perf` 创建 `rpmsg:perf_test` 服务，小核收到大核 Linux 发送的数据后立即 echo 完整 frame，用于测量 RPMsg request/echo 往返 RTT 和吞吐。大核侧程序位于 `07_rpmsg/k3_rpmsg_perf.c`。
+
+`rpmsg_send_test` 创建 `rpmsg:send_test` 服务，小核收到 DATA frame 后返回同序号 `received` ACK，用于验证大核发送、小核确认链路和 ACK RTT。大核侧程序位于 `07_rpmsg_send/k3_rpmsg_send.c`。
 
 ## 建议测试流程
 
 1. 单独运行一个测试命令，确认基础功能和输出正常。
 2. 对算法类测试，先观察默认 `1000 Hz` 周期下是否存在超时或异常波动。
 3. 对实时性测试，先在系统空载下运行 `rtlat_perf`，再配合 `sched_perf` 或算法类测试观察干扰影响。
-4. 对 RPMsg 测试，先在小核启动 `rpmsg_perf` 或 `rpmsg_send_test`，再在大核 Linux 侧运行对应目录下的大核测试程序。
+4. 对 RPMsg 测试，先在小核启动 `rpmsg_perf` 或 `rpmsg_send_test`，再在大核 Linux 侧编译并运行对应目录下的 `k3_rpmsg_perf` 或 `k3_rpmsg_send`。
 5. 多次重复测试时，尽量保持相同 CPU 频率、系统负载、日志等级和外设状态，便于横向比较。
 
 ## 注意事项
@@ -99,4 +110,4 @@ sched_perf
 - 频繁 `rt_kprintf` 会影响实时性和吞吐测试结果，分析性能时应重点关注稳定运行阶段的数据。
 - 若需要更改周期、迭代次数或打印间隔，可在对应测试源文件顶部的宏定义中调整。
 - 同时运行多个测试会相互干扰，适合压力场景；如果要测单项性能，建议一次只运行一个测试。
-- `07_rpmsg/` 涉及大核 Linux 侧程序编译和设备节点，请参考该目录下的专用说明文档。
+- `07_rpmsg/` 和 `07_rpmsg_send/` 涉及大核 Linux 侧程序编译、`/dev/rpmsg_ctrl0` 与 `/dev/rpmsgX` 设备节点，请参考对应目录下的专用说明文档。

@@ -65,7 +65,7 @@ rpmsg_perf [stat]
 在 K3 Linux 目标板上编译：
 
 ```bash
-cd /media/chenzhaoqi/data/tmp/esos_dev/4.0.1-perf/esos/bsp/spacemit/applications/rt-perf-test/07_rpmsg
+cd rt-perf-test/07_rpmsg
 gcc -Wall -Wextra -O2 -pthread -o k3_rpmsg_perf k3_rpmsg_perf.c
 ```
 

@@ -205,18 +205,18 @@ int rpmsg_send_test_start(rt_bool_t start_print_thread)
 
 static void cmd_rpmsg_send_test_usage(void)
 {
-    rt_kprintf("Usage: rpmsg_send_test [--no-print|-q]\n");
+    rt_kprintf("Usage: rpmsg_send_test [--print|-q]\n");
     rt_kprintf("       rpmsg_send_test --help\n");
 }
 
 static int cmd_rpmsg_send_test(int argc, char *argv[])
 {
-    rt_bool_t start_print_thread = RT_TRUE;
+    rt_bool_t start_print_thread = RT_FALSE;
     int i;
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--no-print") || !strcmp(argv[i], "-q")) {
-            start_print_thread = RT_FALSE;
+        if (!strcmp(argv[i], "--print") || !strcmp(argv[i], "-q")) {
+            start_print_thread = RT_TRUE;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             cmd_rpmsg_send_test_usage();
             return 0;

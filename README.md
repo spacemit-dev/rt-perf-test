@@ -13,6 +13,7 @@
 | `05_memory/` | `mem_perf` | 内存/缓存访问性能测试，评估拷贝、填充、读写等基础内存操作 |
 | `06_rtlat/` | `rtlat_perf` | 实时延迟测试，覆盖调度、抢占、IPC、IRQ 等实时性指标 |
 | `07_rpmsg/` | `rpmsg_perf` | 大核 Linux 与小核 ESOS/RT-Thread 的 RPMsg echo 通信性能测试；详细说明见 `07_rpmsg/README.md` |
+| `07_rpmsg_send/` | `rpmsg_send_test` | 大核 Linux 单线程发送、小核收到后 ACK、大核单线程接收并校验数量一致性；详细说明见 `07_rpmsg_send/README.md` |
 | `08_mpc/` | `mpc_perf` | 四轮 MPC 闭环控制性能测试 |
 | `09_model_infer/` | `model_perf` | 模型推理仿真性能测试 |
 | `10_sched_stress/` | `sched_perf` | 调度压力/多任务干扰测试 |
@@ -31,6 +32,7 @@
 - `05_memory/mem_perf_test.c`
 - `06_rtlat/rtlat_perf_test.c`
 - `07_rpmsg/rpmsg_perf_test.c`
+- `07_rpmsg_send/rpmsg_send_test.c`
 - `08_mpc/mpc_perf_test.c`
 - `09_model_infer/simulate_model.c`
 - `10_sched_stress/sched_stress_perf_test.c`
@@ -57,6 +59,7 @@ ahrs_perf
 mem_perf
 rtlat_perf
 rpmsg_perf
+rpmsg_send_test
 mpc_perf
 model_perf
 sched_perf
@@ -80,14 +83,14 @@ sched_perf
 
 ### 大小核通信类
 
-`rpmsg_perf` 创建 `rpmsg:perf_test` 服务，小核收到大核 Linux 发送的数据后立即 echo 回传，用于测量 RPMsg request/echo 往返性能。小核侧每 `1000` 包记录一次统计，测试结束后统一打印，避免测试过程中频繁打印影响结果。
+`rpmsg_perf` 创建 `rpmsg:perf_test` 服务，小核收到大核 Linux 发送的数据后立即 echo 回传，用于测量 RPMsg request/echo 往返性能。`rpmsg_send_test` 创建 `rpmsg:send_test` 服务，大核 Linux 侧一个线程负责发送 DATA frame，另一个线程负责接收小核返回的 `received` ACK，测试结束后打印发送数量和 ACK 数量是否一致。
 
 ## 建议测试流程
 
 1. 单独运行一个测试命令，确认基础功能和输出正常。
 2. 对算法类测试，先观察默认 `1000 Hz` 周期下是否存在超时或异常波动。
 3. 对实时性测试，先在系统空载下运行 `rtlat_perf`，再配合 `sched_perf` 或算法类测试观察干扰影响。
-4. 对 RPMsg 测试，先在小核启动 `rpmsg_perf`，再在大核 Linux 侧运行 `07_rpmsg/k3_rpmsg_perf`。
+4. 对 RPMsg 测试，先在小核启动 `rpmsg_perf` 或 `rpmsg_send_test`，再在大核 Linux 侧运行对应目录下的大核测试程序。
 5. 多次重复测试时，尽量保持相同 CPU 频率、系统负载、日志等级和外设状态，便于横向比较。
 
 ## 注意事项

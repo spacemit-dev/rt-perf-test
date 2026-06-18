@@ -20,6 +20,7 @@ elif rtconfig.BOARD == 'os1_rcpu':
   		'rt-perf-test/05_memory/mem_perf_test.c',
 		'rt-perf-test/06_rtlat/rtlat_perf_test.c',
 		'rt-perf-test/07_rpmsg/rpmsg_perf_test.c',
+		'rt-perf-test/07_rpmsg_send/rpmsg_send_test.c',
 		'rt-perf-test/08_mpc/mpc_perf_test.c',
 		'rt-perf-test/09_model_infer/simulate_model.c',
 		'rt-perf-test/10_sched_stress/sched_stress_perf_test.c',

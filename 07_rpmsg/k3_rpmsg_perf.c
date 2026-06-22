@@ -4,6 +4,9 @@
  * One pthread sends one DATA frame to the RCPU service "rpmsg:perf_test" and
  * waits for its echo before sending the next frame. A second pthread receives
  * echoed frames and calculates pure one-packet round-trip RTT.
+ *
+ * Spacemit K3 Linux 侧 RPMsg 往返吞吐/RTT 测试程序：发送线程逐包发送并
+ * 等待 RCPU 回显，接收线程负责读取回显并统计单包往返时延。
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -23,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/* 默认测试参数，可通过命令行选项覆盖。 */
 #define DEFAULT_RPMSG_CTRL_DEV       "/dev/rpmsg_ctrl0"
 #define DEFAULT_RPMSG_DATA_DEV       "/dev/rpmsg0"
 #define DEFAULT_SERVICE_NAME         "rpmsg:perf_test"
@@ -33,6 +37,7 @@
 #define DEFAULT_REPORT_INTERVAL      1000U
 #define DEFAULT_IDLE_TIMEOUT_MS      3000U
 #define DEFAULT_SLOW_RTT_US          300U
+/* RPMsg 有效载荷最大长度 = vring buffer 大小 - RPMsg 头部大小。 */
 #define RPMSG_PERF_MAGIC             0x52504631U
 #define RPMSG_PERF_HEADER_SIZE       20U
 #define RPMSG_PERF_RPMSG_BUFFER_SIZE 512U
@@ -45,9 +50,11 @@ struct rpmsg_endpoint_info {
 	uint32_t dst;
 };
 
+/* 与 Linux rpmsg_char 驱动约定的 endpoint 创建/销毁 ioctl。 */
 #define RPMSG_CREATE_EPT_IOCTL _IOW(0xb5, 0x1, struct rpmsg_endpoint_info)
 #define RPMSG_DESTROY_EPT_IOCTL _IO(0xb5, 0x2)
 
+/* 测试帧头部携带序号和发送时间戳，payload 用于填充指定大小的数据。 */
 struct rpmsg_perf_frame {
 	uint32_t magic;
 	uint32_t seq;
@@ -56,6 +63,7 @@ struct rpmsg_perf_frame {
 	uint8_t payload[RPMSG_PERF_MAX_FRAME_SIZE - RPMSG_PERF_HEADER_SIZE];
 };
 
+/* 运行时配置，主要来自默认值和命令行参数。 */
 struct rpmsg_perf_config {
 	const char *ctrl_dev;
 	const char *data_dev;
@@ -69,16 +77,19 @@ struct rpmsg_perf_config {
 	uint32_t slow_rtt_us;
 };
 
+/* 创建 endpoint 前记录已有 /dev/rpmsgN，用于识别新生成的数据设备。 */
 struct rpmsg_dev_snapshot {
 	dev_t devs[64];
 	size_t count;
 };
 
+/* 记录超过阈值的 RTT 样本，方便定位异常慢包。 */
 struct rpmsg_slow_rtt_sample {
 	uint32_t seq;
 	uint64_t rtt_ns;
 };
 
+/* 发送/接收线程共享状态与统计计数，访问时需持有 lock。 */
 struct rpmsg_perf_shared {
 	int data_fd;
 	const struct rpmsg_perf_config *cfg;
@@ -106,6 +117,7 @@ struct rpmsg_perf_shared {
 	int receiver_error;
 };
 
+/* RTT 汇总统计结果，单位均为纳秒。 */
 struct rpmsg_rtt_summary {
 	uint64_t min_ns;
 	uint64_t max_ns;
@@ -120,6 +132,7 @@ static volatile sig_atomic_t stop_requested;
 static void signal_handler(int sig)
 {
 	(void)sig;
+	/* 收到 SIGINT/SIGTERM 后仅置位标志，由各线程自行安全退出。 */
 	stop_requested = 1;
 }
 
@@ -127,6 +140,7 @@ static uint64_t now_ns(void)
 {
 	struct timespec ts;
 
+	/* 使用单调时钟统计耗时，避免系统时间调整影响 RTT。 */
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
@@ -152,6 +166,7 @@ static void print_usage(const char *prog)
 
 static void config_init(struct rpmsg_perf_config *cfg)
 {
+	/* 初始化为默认测试配置，parse_args() 会按需覆盖。 */
 	cfg->ctrl_dev = DEFAULT_RPMSG_CTRL_DEV;
 	cfg->data_dev = DEFAULT_RPMSG_DATA_DEV;
 	cfg->service_name = DEFAULT_SERVICE_NAME;
@@ -168,6 +183,7 @@ static int parse_args(int argc, char **argv, struct rpmsg_perf_config *cfg)
 {
 	int i;
 
+	/* 简单解析短选项，所有数值参数支持 0x 前缀等 strtoul 格式。 */
 	for (i = 1; i < argc; ++i) {
 		if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
 			cfg->packet_count = (uint32_t)strtoul(argv[++i], NULL, 0);
@@ -212,6 +228,7 @@ static void snapshot_rpmsg_devs(struct rpmsg_dev_snapshot *snapshot)
 	struct stat st;
 	int i;
 
+	/* 保存设备号而非路径名，避免 /dev/rpmsgN 编号变化造成误判。 */
 	snapshot->count = 0;
 	for (i = 0; i < 64; ++i) {
 		snprintf(path, sizeof(path), "/dev/rpmsg%d", i);
@@ -261,6 +278,7 @@ static int wait_new_rpmsg_data_dev(const struct rpmsg_dev_snapshot *before,
 {
 	uint64_t start_ns = now_ns();
 
+	/* endpoint 创建后 rpmsg 数据设备可能异步出现，这里最多等待 3 秒。 */
 	while (now_ns() - start_ns < 3000000000ULL) {
 		if (find_new_rpmsg_data_dev(before, path, path_size) == 0) {
 			return 0;
@@ -280,6 +298,7 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
 
 	snapshot_rpmsg_devs(&before);
 
+	/* 通过控制设备创建到 RCPU 服务的 endpoint。 */
 	*ctrl_fd = open(cfg->ctrl_dev, O_RDWR);
 	if (*ctrl_fd < 0) {
 		fprintf(stderr, "open %s failed: %s\n", cfg->ctrl_dev, strerror(errno));
@@ -298,6 +317,7 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
 		return -1;
 	}
 
+	/* 未显式指定数据设备时，自动查找创建 endpoint 后新增的 /dev/rpmsgN。 */
 	if (strcmp(cfg->data_dev, DEFAULT_RPMSG_DATA_DEV) == 0) {
 		if (wait_new_rpmsg_data_dev(&before, data_dev, sizeof(data_dev)) != 0) {
 			fprintf(stderr, "failed to locate rpmsg data device\n");
@@ -317,6 +337,7 @@ static int rpmsg_open(const struct rpmsg_perf_config *cfg, int *ctrl_fd, int *da
 		return -1;
 	}
 
+	/* 设置非阻塞，配合 poll 控制读写等待和退出。 */
 	flags = fcntl(*data_fd, F_GETFL, 0);
 	if (flags < 0 || fcntl(*data_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
 		fprintf(stderr, "set %s nonblock failed: %s\n", data_dev, strerror(errno));
@@ -350,6 +371,7 @@ static int wait_fd_ready(int fd, short events, int timeout_ms, const char *op)
 	struct pollfd pfd;
 	int ret;
 
+	/* 统一处理非阻塞 fd 的可读/可写等待及错误事件。 */
 	memset(&pfd, 0, sizeof(pfd));
 	pfd.fd = fd;
 	pfd.events = events;
@@ -381,6 +403,7 @@ static int wait_fd_ready(int fd, short events, int timeout_ms, const char *op)
 
 static int make_abs_timeout(struct timespec *ts, uint32_t timeout_ms)
 {
+	/* pthread_cond_timedwait 需要绝对 CLOCK_REALTIME 超时时间。 */
 	if (clock_gettime(CLOCK_REALTIME, ts) != 0) {
 		return -1;
 	}
@@ -406,6 +429,7 @@ static int wait_echo_for_seq(struct rpmsg_perf_shared *shared, uint32_t seq)
 	}
 
 	pthread_mutex_lock(&shared->lock);
+	/* 发送线程按序等待对应 seq 的回显，确保测试为一发一收的纯 RTT。 */
 	while (!stop_requested && !shared->echoed[seq] && !shared->receiver_error) {
 		ret = pthread_cond_timedwait(&shared->echo_cond, &shared->lock, &deadline);
 		if (ret == ETIMEDOUT) {
@@ -441,10 +465,12 @@ static void *send_thread_entry(void *arg)
 	memset(&frame, 0, sizeof(frame));
 	frame.magic = RPMSG_PERF_MAGIC;
 	frame.payload_len = cfg->payload_size;
+	/* payload 填充固定递增模式，便于对端原样回显。 */
 	for (seq = 0; seq < cfg->payload_size; ++seq) {
 		frame.payload[seq] = (uint8_t)(seq & 0xffU);
 	}
 
+	/* 每发送一包后等待其回显，再继续发送下一包。 */
 	for (seq = 0; seq < cfg->packet_count && !stop_requested; ++seq) {
 		ssize_t wr;
 
@@ -452,6 +478,7 @@ static void *send_thread_entry(void *arg)
 		frame.send_ns = now_ns();
 
 		while (!stop_requested) {
+			/* 非阻塞写遇到 EAGAIN 时等待 TX buffer 可写。 */
 			wr = write(shared->data_fd, &frame, shared->frame_len);
 			if (wr >= 0) {
 				break;
@@ -506,6 +533,7 @@ out:
 static int check_echo_frame(const struct rpmsg_perf_config *cfg,
 							const struct rpmsg_perf_frame *frame, size_t len)
 {
+	/* 校验回显帧的长度、魔数、序号和 payload 长度是否符合预期。 */
 	if (len < RPMSG_PERF_HEADER_SIZE || len > RPMSG_PERF_MAX_FRAME_SIZE) {
 		return -1;
 	}
@@ -532,6 +560,7 @@ static void *recv_thread_entry(void *arg)
 	const struct rpmsg_perf_config *cfg = shared->cfg;
 	struct rpmsg_perf_frame frame;
 
+	/* 接收线程持续读取回显帧，并唤醒正在等待对应 seq 的发送线程。 */
 	while (!stop_requested) {
 		uint32_t sent_count;
 		int ready;
@@ -539,6 +568,7 @@ static void *recv_thread_entry(void *arg)
 		ssize_t rd;
 
 		pthread_mutex_lock(&shared->lock);
+		/* 已收完所有包，或发送侧结束且无更多待收包时退出。 */
 		sender_done = shared->sender_done;
 		sent_count = shared->sent_count;
 		if (shared->echo_count >= cfg->packet_count ||
@@ -575,13 +605,16 @@ static void *recv_thread_entry(void *arg)
 
 		pthread_mutex_lock(&shared->lock);
 		if (check_echo_frame(cfg, &frame, (size_t)rd) != 0) {
+			/* 格式不符的帧不参与 RTT 统计。 */
 			shared->bad_echo_count++;
 		} else if (shared->echoed[frame.seq]) {
+			/* 同一序号重复回显，只记录错误计数。 */
 			shared->duplicate_echo_count++;
 		} else {
 			uint64_t rtt_ns = now_ns() - frame.send_ns;
 			uint64_t slow_rtt_ns = (uint64_t)cfg->slow_rtt_us * 1000ULL;
 
+			/* 记录有效 RTT 样本，并更新吞吐、最小/最大/总 RTT 等统计。 */
 			shared->echoed[frame.seq] = 1;
 			shared->echo_count++;
 			shared->rx_bytes += (uint64_t)rd;
@@ -616,6 +649,7 @@ static uint32_t count_missing_echoes(const uint8_t *echoed, uint32_t sent_count)
 	uint32_t missing = 0;
 	uint32_t i;
 
+	/* 只统计已成功发送范围内未收到回显的序号。 */
 	for (i = 0; i < sent_count; ++i) {
 		if (!echoed[i]) {
 			missing++;
@@ -643,6 +677,7 @@ static uint32_t percentile_index(uint32_t count, uint32_t percentile)
 {
 	uint64_t rank;
 
+	/* 使用向上取整的百分位 rank，返回 0 基数组下标。 */
 	if (count == 0U) {
 		return 0U;
 	}
@@ -671,6 +706,7 @@ static int build_rtt_summary(const struct rpmsg_perf_shared *shared,
 		return -1;
 	}
 
+	/* 拷贝后排序，避免破坏原始 RTT 采样顺序。 */
 	memcpy(sorted, shared->rtt_ns, (size_t)count * sizeof(sorted[0]));
 	qsort(sorted, count, sizeof(sorted[0]), compare_u64);
 
@@ -703,6 +739,7 @@ int main(int argc, char **argv)
 	uint32_t sent_count;
 	struct rpmsg_rtt_summary rtt;
 
+	/* 1. 解析配置并建立 RPMsg endpoint。 */
 	config_init(&cfg);
 	parse_ret = parse_args(argc, argv, &cfg);
 	if (parse_ret > 0) {
@@ -719,6 +756,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* 2. 初始化共享状态和统计数组。 */
 	memset(&shared, 0, sizeof(shared));
 	shared.data_fd = data_fd;
 	shared.cfg = &cfg;
@@ -740,6 +778,7 @@ int main(int argc, char **argv)
 	}
 
 	start_ns = now_ns();
+	/* 3. 先启动接收线程，再启动发送线程，避免首包回显无人读取。 */
 	if (pthread_create(&recv_tid, NULL, recv_thread_entry, &shared) != 0) {
 		fprintf(stderr, "create recv thread failed\n");
 		goto out_cond;
@@ -753,6 +792,7 @@ int main(int argc, char **argv)
 	send_started = 1;
 
 out_join:
+	/* 4. 等待线程退出后汇总结果。 */
 	if (send_started) {
 		pthread_join(send_tid, NULL);
 	}
